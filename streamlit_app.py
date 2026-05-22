@@ -13,6 +13,7 @@ Run locally:
     streamlit run streamlit_app.py
 """
 
+import math
 from datetime import date
 
 import pandas as pd
@@ -26,6 +27,10 @@ import yfinance as yf
 MODE_CSP = "Cash-Secured Put"
 MODE_CC  = "Covered Call"
 
+# Annual risk-free rate used for the Black-Scholes delta estimate.
+# Delta is fairly insensitive to this; adjust to taste (e.g. T-bill yield).
+RISK_FREE_RATE = 0.045
+
 COLOR_SUCCESS = "#10b981"
 COLOR_DANGER  = "#ef4444"
 COLOR_WARNING = "#f59e0b"
@@ -38,6 +43,87 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Option math — Black-Scholes / Merton (for delta)
+# ─────────────────────────────────────────────────────────────────────
+def _norm_cdf(x: float) -> float:
+    """Standard-normal CDF via the error function (no SciPy needed)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_price(opt: str, S: float, K: float, T: float,
+              r: float, q: float, sigma: float):
+    """Black-Scholes-Merton price with continuous dividend yield q."""
+    if sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return None
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if opt == "call":
+        return S * math.exp(-q * T) * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
+
+
+def _implied_vol(opt: str, price: float, S: float, K: float, T: float,
+                 r: float, q: float):
+    """Back implied vol out of an option's mid price by bisection.
+
+    Returns None when the price sits outside the model's no-arbitrage
+    bounds (common for stale / illiquid quotes) so the caller can fall back.
+    """
+    if price <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return None
+    lo, hi = 1e-4, 5.0
+    p_lo = _bs_price(opt, S, K, T, r, q, lo)
+    p_hi = _bs_price(opt, S, K, T, r, q, hi)
+    if p_lo is None or p_hi is None or not (p_lo <= price <= p_hi):
+        return None
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        pm = _bs_price(opt, S, K, T, r, q, mid)
+        if pm is None:
+            return None
+        if pm > price:
+            hi = mid
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+
+def _bs_delta(opt: str, S: float, K: float, T: float,
+              r: float, q: float, sigma):
+    """Black-Scholes-Merton delta. Calls in [0, 1], puts in [-1, 0]."""
+    if sigma is None or sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return None
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    if opt == "call":
+        return math.exp(-q * T) * _norm_cdf(d1)
+    return -math.exp(-q * T) * _norm_cdf(-d1)
+
+
+def _trailing_dividend_yield(tk_obj, price: float) -> float:
+    """Estimate a continuous dividend yield from the last 12 months of payouts."""
+    try:
+        divs = tk_obj.dividends
+        if divs is None or divs.empty or price <= 0:
+            return 0.0
+        cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
+        ttm = float(divs[divs.index >= cutoff].sum())
+        q = ttm / price
+        return q if 0.0 <= q < 0.5 else 0.0   # clamp obvious bad data
+    except Exception:
+        return 0.0
+
+
+def _contract_delta(opt: str, mid_price: float, yahoo_iv, S: float, K: float,
+                    T: float, r: float, q: float):
+    """Delta for one contract: derive IV from the mid, else fall back to Yahoo IV."""
+    sigma = _implied_vol(opt, mid_price, S, K, T, r, q)
+    if sigma is None:
+        sigma = float(yahoo_iv) if (yahoo_iv is not None and pd.notna(yahoo_iv)
+                                    and yahoo_iv > 0) else None
+    return _bs_delta(opt, S, K, T, r, q, sigma)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -64,6 +150,11 @@ def fetch_options(mode: str, ticker: str, strike: float, strike_range: float,
     today = date.today()
     rows = []
     kind = "puts" if mode == MODE_CSP else "calls"
+
+    # Inputs for the Black-Scholes delta estimate
+    opt_type = "put" if mode == MODE_CSP else "call"
+    r = RISK_FREE_RATE
+    q = _trailing_dividend_yield(tk_obj, current_price)
 
     for exp_str in expirations:
         exp_date = date.fromisoformat(exp_str)
@@ -98,6 +189,13 @@ def fetch_options(mode: str, ticker: str, strike: float, strike_range: float,
 
             ann_return = (pct_return * 365 / days_to_exp) if days_to_exp > 0 else 0
 
+            # Black-Scholes-Merton delta (IV backed out of the mid, else Yahoo IV)
+            yahoo_iv = row["impliedVolatility"] if "impliedVolatility" in row.index else None
+            delta = _contract_delta(
+                opt_type, float(mid_price), yahoo_iv,
+                current_price, strike_val, days_to_exp / 365.0, r, q,
+            )
+
             row_dict = {
                 "Contract":   row["contractSymbol"],
                 "Expiry":     exp_str,
@@ -108,6 +206,7 @@ def fetch_options(mode: str, ticker: str, strike: float, strike_range: float,
                 "Premium":    round(float(mid_price), 2),
                 "Volume":     int(row["volume"]) if pd.notna(row["volume"]) else 0,
                 "OI":         int(row["openInterest"]) if pd.notna(row["openInterest"]) else 0,
+                "Delta":      round(delta, 3) if delta is not None else None,
                 "Ret %":      round(pct_return, 3),
                 "Ann. Ret %": round(ann_return, 2),
             }
@@ -281,7 +380,7 @@ df_top = (df.sort_values("Ann. Ret %", ascending=False)
             .reset_index(drop=True))
 
 display_cols = ["Expiry", "DTE", "Strike", "Bid", "Ask", "Premium",
-                "Volume", "OI", "Ret %", "Ann. Ret %"]
+                "Volume", "OI", "Delta", "Ret %", "Ann. Ret %"]
 if mode == MODE_CC:
     display_cols.append("If-Called %")
 
@@ -289,6 +388,7 @@ styler = (df_top[display_cols].style
           .format({
               "Strike": "{:.2f}", "Bid": "{:.2f}", "Ask": "{:.2f}",
               "Premium": "{:.2f}", "Volume": "{:,}", "OI": "{:,}",
+              "Delta": lambda v: f"{v:.3f}" if pd.notna(v) else "—",
               "Ret %": "{:.3f}", "Ann. Ret %": "{:.2f}",
               **({"If-Called %": "{:.2f}"} if mode == MODE_CC else {}),
           })
@@ -305,17 +405,24 @@ st.download_button(
 )
 
 # ── Notes ────────────────────────────────────────────────────────────
+delta_note = (
+    "Delta is a Black-Scholes-Merton estimate (vol implied from the mid, "
+    "trailing dividend yield included); |delta| ≈ rough probability of finishing "
+    "in the money. Treat it as approximate, not a broker-grade figure."
+)
+
 if mode == MODE_CSP:
     st.caption(
         "Premium = mid of bid/ask • Ret % = Premium ÷ Strike • "
-        "Ann. Ret % = Ret % × (365 ÷ DTE). Mid-prices shown; actual fills may "
-        "differ. Short puts carry downside risk if the stock drops below the strike."
+        "Ann. Ret % = Ret % × (365 ÷ DTE). " + delta_note + " Mid-prices shown; "
+        "actual fills may differ. Short puts carry downside risk if the stock "
+        "drops below the strike."
     )
 else:
     st.caption(
         "Premium = mid of bid/ask • Ret % = Premium ÷ Cost per share • "
         "Ann. Ret % = Ret % × (365 ÷ DTE) • If-Called % = premium yield + capital "
-        "gain to the strike if shares are assigned. Mid-prices shown; actual fills "
-        "may differ. A covered call caps your upside at the strike and your shares "
-        "may be called away."
+        "gain to the strike if shares are assigned. " + delta_note + " Mid-prices "
+        "shown; actual fills may differ. A covered call caps your upside at the "
+        "strike and your shares may be called away."
     )
