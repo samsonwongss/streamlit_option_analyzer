@@ -589,6 +589,22 @@ if active_mode in SPREAD_MODES:
     new_ret  = new_pl * 100
     new_ann  = new_ret * 365 / dte if dte > 0 else 0
 
+    # Static: strike distances from current price (positive = above price)
+    short_k = float(row["Short K"])
+    long_k  = float(row["Long K"])
+    short_vs_price = (short_k - price) / price * 100 if price > 0 else 0
+    long_vs_price  = (long_k  - price) / price * 100 if price > 0 else 0
+
+    s1, s2 = st.columns(2)
+    s1.metric(
+        "Short K vs Price", f"{short_vs_price:+.2f}%",
+        help=f"Short strike ${short_k:.2f} vs current price ${price:.2f}.",
+    )
+    s2.metric(
+        "Long K vs Price",  f"{long_vs_price:+.2f}%",
+        help=f"Long strike ${long_k:.2f} vs current price ${price:.2f}.",
+    )
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Net credit", f"${new_credit:.2f}",
               f"{new_credit - orig_credit:+.2f}")
@@ -646,7 +662,8 @@ else:
     new_ann = new_ret * 365 / dte if dte > 0 else 0
 
     is_cc = active_mode == MODE_CC
-    cols = st.columns(4 if is_cc else 3)
+    n_cols = 5 if is_cc else 4
+    cols = st.columns(n_cols)
     cols[0].metric("Premium",    f"${new_premium:.2f}",
                    f"{new_premium - orig_premium:+.2f}")
     cols[1].metric("Ret %",      f"{new_ret:.3f}%",
@@ -661,6 +678,13 @@ else:
         delta_if_called = (f"{new_if_called - orig_if_called:+.2f}%"
                            if orig_if_called is not None else None)
         cols[3].metric("If-Called %", f"{new_if_called:.2f}%", delta_if_called)
+
+    # Static: strike distance from current price (positive = above price)
+    strike_vs_price = (strike_val - price) / price * 100 if price > 0 else 0
+    cols[-1].metric(
+        "Strike vs Price", f"{strike_vs_price:+.2f}%",
+        help=f"Strike ${strike_val:.2f} vs current price ${price:.2f}.",
+    )
 
     if is_cc:
         st.caption(
