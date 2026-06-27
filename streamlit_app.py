@@ -1,7 +1,9 @@
 """
 Options Analyzer — Streamlit
 ============================
-Screen option-income and credit-spread opportunities.
+Screen option-income and credit-spread opportunities, then fine-tune the
+premium / net credit on any candidate to see how the fill price changes
+the return and annualized return rate.
 
 Strategies:
   • Cash-Secured Put  — Ret % = Premium / Strike
@@ -35,7 +37,7 @@ MODE_BCS = "Bear Call Spread"
 SPREAD_MODES = {MODE_BPS, MODE_BCS}
 SINGLE_MODES = {MODE_CSP, MODE_CC}
 
-RISK_FREE_RATE = 0.045   # annualised risk-free rate used in BS delta
+RISK_FREE_RATE = 0.045
 
 COLOR_SUCCESS = "#10b981"
 COLOR_DANGER  = "#ef4444"
@@ -55,13 +57,10 @@ st.set_page_config(
 #  Black-Scholes delta (scipy-free — uses math.erf)
 # ─────────────────────────────────────────────────────────────────────
 def _norm_cdf(x: float) -> float:
-    """Standard-normal CDF via the error function."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def bs_delta(S: float, K: float, T: float, sigma,
-             option_type: str):
-    """Black-Scholes delta.  option_type: 'call' | 'put'."""
+def bs_delta(S: float, K: float, T: float, sigma, option_type: str):
     if sigma is None or T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return None
     try:
@@ -81,7 +80,6 @@ def _mid(row) -> float:
 
 
 def _parse_pl_ratio(s: str) -> float:
-    """Parse '1:3' → 0.333…  or '0.333' → 0.333."""
     s = s.strip()
     if not s:
         raise ValueError("Target P/L ratio is required.")
@@ -97,7 +95,6 @@ def _parse_pl_ratio(s: str) -> float:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_options(mode: str, ticker: str, strike: float, strike_range: float,
                   min_volume: int, dte_max: int, cost_basis: float | None):
-    """Return (current_price, cost_per_share, DataFrame)."""
     tk_obj = yf.Ticker(ticker)
     current_price  = float(tk_obj.fast_info.last_price)
     cost_per_share = cost_basis if (cost_basis and cost_basis > 0) else current_price
@@ -183,11 +180,6 @@ def fetch_options(mode: str, ticker: str, strike: float, strike_range: float,
 def fetch_spreads(mode: str, ticker: str, strike: float, strike_range: float,
                   max_spread: float, min_pl_ratio: float,
                   min_volume: int, dte_max: int):
-    """Return (current_price, DataFrame) for credit-spread pairs.
-
-    BPS  — short higher-strike put  + long lower-strike put
-    BCS  — short lower-strike call  + long higher-strike call
-    """
     tk_obj = yf.Ticker(ticker)
     current_price = float(tk_obj.fast_info.last_price)
 
@@ -213,7 +205,6 @@ def fetch_spreads(mode: str, ticker: str, strike: float, strike_range: float,
         contracts = chain.puts if is_put else chain.calls
         opt_type  = "put" if is_put else "call"
 
-        # Short-leg candidates near the target strike
         lo     = strike - strike_range
         hi     = strike + strike_range
         shorts = contracts[(contracts["strike"] >= lo) &
@@ -229,7 +220,6 @@ def fetch_spreads(mode: str, ticker: str, strike: float, strike_range: float,
                 if "impliedVolatility" in sr.index and pd.notna(sr["impliedVolatility"]) else None
             short_delta  = bs_delta(current_price, short_strike, T, short_iv, opt_type)
 
-            # Long-leg candidates within max_spread
             if is_put:
                 longs = contracts[
                     (contracts["strike"] < short_strike) &
@@ -365,13 +355,12 @@ st.sidebar.caption(_subtitles[mode])
 st.sidebar.markdown("---")
 st.sidebar.subheader("Parameters")
 
-ticker = st.sidebar.text_input("Ticker", value="KO").strip().upper()
-strike = st.sidebar.number_input("Strike price ($)", value=75.0, step=1.0, min_value=0.0,
-                                 help="For spreads, this is the target short-leg strike.")
-strike_range = st.sidebar.number_input("Strike range (±$)", value=2.0, step=0.5, min_value=0.0)
+ticker_input = st.sidebar.text_input("Ticker", value="KO").strip().upper()
+strike_input = st.sidebar.number_input("Strike price ($)", value=75.0, step=1.0, min_value=0.0,
+                                       help="For spreads, this is the target short-leg strike.")
+strike_range_input = st.sidebar.number_input("Strike range (±$)", value=2.0, step=0.5, min_value=0.0)
 
-# Cost Basis — Covered Call only
-cost_basis: float | None = None
+cost_basis_input: float | None = None
 if mode == MODE_CC:
     cost_raw = st.sidebar.text_input(
         "Cost basis ($, blank = market)", value="",
@@ -379,16 +368,14 @@ if mode == MODE_CC:
     ).strip()
     if cost_raw:
         try:
-            cost_basis = float(cost_raw)
+            cost_basis_input = float(cost_raw)
         except ValueError:
             st.sidebar.error("Cost basis must be a number.")
 
-# Spread-only inputs
-max_spread: float | None = None
-pl_ratio: float | None = None
-pl_ratio_str: str = ""
+max_spread_input: float | None = None
+pl_ratio_str = ""
 if mode in SPREAD_MODES:
-    max_spread = st.sidebar.number_input(
+    max_spread_input = st.sidebar.number_input(
         "Max spread width ($)", value=10.0, step=1.0, min_value=0.5,
         help="Max distance between the short and long strikes.",
     )
@@ -397,9 +384,9 @@ if mode in SPREAD_MODES:
         help="Filter spreads with Net Credit / Max Risk ≥ this ratio. Accepts '1:3' or '0.333'.",
     )
 
-min_volume = st.sidebar.number_input("Min volume", value=0, step=1, min_value=0)
-top_n      = st.sidebar.number_input("Top N", value=5, step=1, min_value=1)
-dte_max    = st.sidebar.number_input("DTE max (days)", value=50, step=5, min_value=1)
+min_volume_input = st.sidebar.number_input("Min volume", value=0, step=1, min_value=0)
+top_n_input      = st.sidebar.number_input("Top N", value=5, step=1, min_value=1)
+dte_max_input    = st.sidebar.number_input("DTE max (days)", value=50, step=5, min_value=1)
 
 run = st.sidebar.button("Run Analysis", type="primary", use_container_width=True)
 
@@ -408,80 +395,105 @@ st.sidebar.caption("Premiums use bid/ask mid. Data via Yahoo Finance.")
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Main panel
+#  Session state — persist results across reruns triggered by fine-tune
 # ─────────────────────────────────────────────────────────────────────
-st.title(f"{mode} Analyzer")
+if "results" not in st.session_state:
+    st.session_state.results = None
 
-if not run:
+# Handle a Run click: fetch fresh data and stash it in session_state.
+if run:
+    if not ticker_input:
+        st.error("Ticker is required.")
+    else:
+        try:
+            if mode in SPREAD_MODES:
+                pl_ratio = _parse_pl_ratio(pl_ratio_str)
+                with st.spinner(f"Fetching option chain for {ticker_input}…"):
+                    price, df = fetch_spreads(
+                        mode, ticker_input, float(strike_input),
+                        float(strike_range_input), float(max_spread_input),
+                        float(pl_ratio), int(min_volume_input), int(dte_max_input),
+                    )
+                    try:
+                        hist = fetch_history(ticker_input)
+                    except Exception:
+                        hist = None
+                st.session_state.results = {
+                    "mode": mode, "ticker": ticker_input, "price": price,
+                    "cost_per_share": None, "df": df, "hist": hist,
+                    "strike": float(strike_input), "top_n": int(top_n_input),
+                }
+            else:
+                with st.spinner(f"Fetching option chain for {ticker_input}…"):
+                    price, cost_per_share, df = fetch_options(
+                        mode, ticker_input, float(strike_input),
+                        float(strike_range_input), int(min_volume_input),
+                        int(dte_max_input), cost_basis_input,
+                    )
+                    try:
+                        hist = fetch_history(ticker_input)
+                    except Exception:
+                        hist = None
+                st.session_state.results = {
+                    "mode": mode, "ticker": ticker_input, "price": price,
+                    "cost_per_share": cost_per_share, "df": df, "hist": hist,
+                    "strike": float(strike_input), "top_n": int(top_n_input),
+                }
+        except Exception as e:
+            st.error(str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Main panel — render from session_state so fine-tune widgets don't wipe it
+# ─────────────────────────────────────────────────────────────────────
+results = st.session_state.results
+
+if results is None:
+    st.title("Options Analyzer")
     st.info("Set your parameters in the sidebar and click **Run Analysis**.")
     st.stop()
 
-if not ticker:
-    st.error("Ticker is required.")
-    st.stop()
+active_mode    = results["mode"]
+ticker         = results["ticker"]
+price          = results["price"]
+cost_per_share = results["cost_per_share"]
+df             = results["df"]
+hist           = results["hist"]
+target_strike  = results["strike"]
+top_n          = results["top_n"]
 
-# Validate spread inputs
-if mode in SPREAD_MODES:
-    try:
-        pl_ratio = _parse_pl_ratio(pl_ratio_str)
-    except Exception as e:
-        st.error(f"Invalid P/L ratio: {e}")
-        st.stop()
-
-with st.spinner(f"Fetching option chain for {ticker}…"):
-    try:
-        if mode in SPREAD_MODES:
-            price, df = fetch_spreads(
-                mode, ticker, float(strike), float(strike_range),
-                float(max_spread), float(pl_ratio),
-                int(min_volume), int(dte_max),
-            )
-            cost_per_share = None
-        else:
-            price, cost_per_share, df = fetch_options(
-                mode, ticker, float(strike), float(strike_range),
-                int(min_volume), int(dte_max), cost_basis,
-            )
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    try:
-        hist = fetch_history(ticker)
-    except Exception:
-        hist = None
+st.title(f"{active_mode} Analyzer")
 
 # ── Summary metrics ──────────────────────────────────────────────────
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Ticker", ticker)
 c2.metric("Price",  f"${price:.2f}")
-if mode in SPREAD_MODES:
-    c3.metric("Best P/L Ratio",  f"{df['P/L'].max():.3f}")
-    c4.metric("Pairs Found",     str(len(df)))
+if active_mode in SPREAD_MODES:
+    c3.metric("Best P/L Ratio", f"{df['P/L'].max():.3f}")
+    c4.metric("Pairs Found",    str(len(df)))
 else:
     c3.metric("Best Ann. Ret.",  f"{df['Ann. Ret %'].max():.2f}%")
     c4.metric("Contracts Found", str(len(df)))
 
-if mode == MODE_CC and cost_per_share and abs(cost_per_share - price) > 1e-6:
+if active_mode == MODE_CC and cost_per_share and abs(cost_per_share - price) > 1e-6:
     st.caption(f"Using cost basis **${cost_per_share:.2f}** for return calculations.")
 
 # ── Chart ────────────────────────────────────────────────────────────
 st.subheader("Price chart — daily candles, 6 months")
 if hist is not None and not hist.empty:
-    if mode in SPREAD_MODES:
-        # Show the best pair's strikes (ranked by P/L then annualized return)
+    if active_mode in SPREAD_MODES:
         best_row = df.sort_values(["P/L", "Ann. Ret %"], ascending=False).iloc[0]
         chart_fig = make_chart(ticker, hist,
                                float(best_row["Short K"]),
                                float(best_row["Long K"]))
     else:
-        chart_fig = make_chart(ticker, hist, float(strike))
+        chart_fig = make_chart(ticker, hist, float(target_strike))
     st.plotly_chart(chart_fig, use_container_width=True)
 else:
     st.warning("Price history unavailable for this ticker.")
 
-# ── Table ────────────────────────────────────────────────────────────
-if mode in SPREAD_MODES:
+# ── Top-N table ──────────────────────────────────────────────────────
+if active_mode in SPREAD_MODES:
     st.subheader("Top spread pairs by P/L ratio")
     df_top = (df.sort_values(["P/L", "Ann. Ret %"], ascending=False)
                 .head(int(top_n)).reset_index(drop=True))
@@ -499,32 +511,168 @@ else:
                 .head(int(top_n)).reset_index(drop=True))
     display_cols = ["Expiry", "DTE", "Strike", "Bid", "Ask", "Premium",
                     "Volume", "OI", "Delta", "Ret %", "Ann. Ret %"]
-    if mode == MODE_CC:
+    if active_mode == MODE_CC:
         display_cols.append("If-Called %")
     fmt = {
         "Strike": "{:.2f}", "Bid": "{:.2f}", "Ask": "{:.2f}",
         "Premium": "{:.2f}", "Volume": "{:,}", "OI": "{:,}",
         "Delta": "{:+.3f}", "Ret %": "{:.3f}", "Ann. Ret %": "{:.2f}",
     }
-    if mode == MODE_CC:
+    if active_mode == MODE_CC:
         fmt["If-Called %"] = "{:.2f}"
 
 styler = (df_top[display_cols].style
           .format(fmt, na_rep="—")
           .apply(lambda r: ['background-color: #0f2e22; color: #10b981'
                             if r.name == 0 else '' for _ in r], axis=1))
-
 st.dataframe(styler, use_container_width=True, hide_index=True)
 
-# CSV download
 csv_kind = {MODE_CSP: "csp", MODE_CC: "covered_call",
-            MODE_BPS: "bull_put_spread", MODE_BCS: "bear_call_spread"}[mode]
+            MODE_BPS: "bull_put_spread", MODE_BCS: "bear_call_spread"}[active_mode]
 st.download_button(
     "Download full results (CSV)",
     data=df.to_csv(index=False).encode("utf-8"),
     file_name=f"{ticker}_{csv_kind}.csv",
     mime="text/csv",
 )
+
+# ─────────────────────────────────────────────────────────────────────
+#  Fine-tune section
+# ─────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("Fine-tune a candidate")
+st.caption(
+    "Pick a contract or spread from the top results and adjust the fill price "
+    "to see how the return and annualized return change."
+)
+
+if active_mode in SPREAD_MODES:
+    # ── Spread fine-tune ─────────────────────────────────────────────
+    labels = [
+        f"{i+1}. {r['Expiry']}  •  Short ${r['Short K']:.2f} / Long ${r['Long K']:.2f}  "
+        f"•  Width ${r['Width']:.2f}  •  Net Cr. ${r['Net Cr.']:.2f}"
+        for i, r in df_top.iterrows()
+    ]
+    sel = st.selectbox(
+        "Spread pair",
+        options=list(range(len(df_top))),
+        format_func=lambda i: labels[i],
+        key="ft_spread_sel",
+    )
+    row = df_top.iloc[sel]
+
+    orig_credit  = float(row["Net Cr."])
+    orig_risk    = float(row["Max Risk"])
+    orig_pl      = float(row["P/L"])
+    orig_ret     = float(row["Ret %"])
+    orig_ann     = float(row["Ann. Ret %"])
+    width        = float(row["Width"])
+    dte          = int(row["DTE"])
+
+    # Net credit must be in (0, width) for the math to make sense.
+    max_credit = max(width - 0.01, 0.01)
+    safe_default = min(max(orig_credit, 0.01), max_credit)
+
+    new_credit = st.number_input(
+        "Net credit ($)",
+        min_value=0.01,
+        max_value=float(max_credit),
+        value=float(safe_default),
+        step=0.05,
+        format="%.2f",
+        key=f"ft_credit_{ticker}_{sel}_{row['Expiry']}_{row['Short K']}_{row['Long K']}",
+        help=f"Spread width is ${width:.2f}; net credit must be below this.",
+    )
+
+    new_risk = width - new_credit
+    new_pl   = new_credit / new_risk if new_risk > 0 else float("inf")
+    new_ret  = new_pl * 100
+    new_ann  = new_ret * 365 / dte if dte > 0 else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Net credit", f"${new_credit:.2f}",
+              f"{new_credit - orig_credit:+.2f}")
+    m2.metric("Max risk",   f"${new_risk:.2f}",
+              f"{new_risk - orig_risk:+.2f}", delta_color="inverse")
+    m3.metric("P/L ratio",  f"{new_pl:.3f}",
+              f"{new_pl - orig_pl:+.3f}")
+    m4.metric("Ann. Ret %", f"{new_ann:.2f}%",
+              f"{new_ann - orig_ann:+.2f}%")
+
+    st.caption(
+        f"Original: Net Cr. ${orig_credit:.2f} • Max Risk ${orig_risk:.2f} • "
+        f"P/L {orig_pl:.3f} • Ret % {orig_ret:.3f} • Ann. Ret % {orig_ann:.2f}%"
+    )
+
+else:
+    # ── Single-leg fine-tune ─────────────────────────────────────────
+    labels = [
+        f"{i+1}. {r['Expiry']}  •  Strike ${r['Strike']:.2f}  •  Premium ${r['Premium']:.2f}"
+        for i, r in df_top.iterrows()
+    ]
+    sel = st.selectbox(
+        "Contract",
+        options=list(range(len(df_top))),
+        format_func=lambda i: labels[i],
+        key="ft_single_sel",
+    )
+    row = df_top.iloc[sel]
+
+    orig_premium = float(row["Premium"])
+    orig_ret     = float(row["Ret %"])
+    orig_ann     = float(row["Ann. Ret %"])
+    strike_val   = float(row["Strike"])
+    dte          = int(row["DTE"])
+
+    # Return basis depends on strategy
+    if active_mode == MODE_CSP:
+        basis = strike_val
+        basis_label = f"Strike ${strike_val:.2f}"
+    else:  # Covered Call — use stored cost-per-share, fall back to live price
+        basis = float(cost_per_share) if cost_per_share else float(price)
+        basis_label = f"Cost basis ${basis:.2f}"
+
+    new_premium = st.number_input(
+        "Premium ($)",
+        min_value=0.01,
+        value=float(orig_premium),
+        step=0.05,
+        format="%.2f",
+        key=f"ft_prem_{ticker}_{sel}_{row['Expiry']}_{row['Strike']}",
+        help=f"Return is computed against {basis_label}.",
+    )
+
+    new_ret = (new_premium / basis) * 100 if basis > 0 else 0
+    new_ann = new_ret * 365 / dte if dte > 0 else 0
+
+    is_cc = active_mode == MODE_CC
+    cols = st.columns(4 if is_cc else 3)
+    cols[0].metric("Premium",    f"${new_premium:.2f}",
+                   f"{new_premium - orig_premium:+.2f}")
+    cols[1].metric("Ret %",      f"{new_ret:.3f}%",
+                   f"{new_ret - orig_ret:+.3f}%")
+    cols[2].metric("Ann. Ret %", f"{new_ann:.2f}%",
+                   f"{new_ann - orig_ann:+.2f}%")
+
+    if is_cc:
+        orig_if_called = float(row["If-Called %"]) if "If-Called %" in row.index else None
+        called_gain    = (strike_val - basis) / basis * 100 if basis > 0 else 0
+        new_if_called  = new_ret + called_gain
+        delta_if_called = (f"{new_if_called - orig_if_called:+.2f}%"
+                           if orig_if_called is not None else None)
+        cols[3].metric("If-Called %", f"{new_if_called:.2f}%", delta_if_called)
+
+    if is_cc:
+        st.caption(
+            f"Original: Premium ${orig_premium:.2f} • Ret % {orig_ret:.3f} • "
+            f"Ann. Ret % {orig_ann:.2f}% • If-Called % "
+            f"{float(row['If-Called %']):.2f}%"
+        )
+    else:
+        st.caption(
+            f"Original: Premium ${orig_premium:.2f} • Ret % {orig_ret:.3f} • "
+            f"Ann. Ret % {orig_ann:.2f}%"
+        )
 
 # ── Notes ────────────────────────────────────────────────────────────
 _notes = {
@@ -553,4 +701,4 @@ _notes = {
         "calls expire worthless."
     ),
 }
-st.caption(_notes[mode])
+st.caption(_notes[active_mode])
