@@ -79,16 +79,6 @@ def _mid(row) -> float:
     return (bid + float(row["ask"])) / 2 if bid > 0 else float(row["lastPrice"])
 
 
-def _parse_pl_ratio(s: str) -> float:
-    s = s.strip()
-    if not s:
-        raise ValueError("Target P/L ratio is required.")
-    if ":" in s:
-        num, den = s.split(":", 1)
-        return float(num) / float(den)
-    return float(s)
-
-
 # ─────────────────────────────────────────────────────────────────────
 #  Single-leg fetch  (CSP / Covered Call)
 # ─────────────────────────────────────────────────────────────────────
@@ -231,6 +221,14 @@ def fetch_spreads(mode: str, ticker: str, strike: float, strike_range: float,
                     (contracts["strike"] <= short_strike + max_spread)
                 ]
 
+            # Apply the same min-volume filter to the long leg — both legs
+            # must meet the volume threshold to keep the pair.
+            longs = longs[longs["volume"].fillna(0) >= min_volume]
+            if longs.empty:
+                continue
+
+            short_vol = int(sr["volume"]) if pd.notna(sr["volume"]) else 0
+
             for _, lr in longs.iterrows():
                 long_strike  = float(lr["strike"])
                 long_mid     = _mid(lr)
@@ -248,14 +246,17 @@ def fetch_spreads(mode: str, ticker: str, strike: float, strike_range: float,
                 if pl_ratio < min_pl_ratio:
                     continue
 
-                ret_pct = pl_ratio * 100
-                ann_ret = ret_pct * 365 / days_to_exp
+                ret_pct  = pl_ratio * 100
+                ann_ret  = ret_pct * 365 / days_to_exp
+                long_vol = int(lr["volume"]) if pd.notna(lr["volume"]) else 0
 
                 rows.append({
                     "Expiry":     exp_str,
                     "DTE":        days_to_exp,
                     "Short K":    round(short_strike, 2),
+                    "Short Vol":  short_vol,
                     "Long K":     round(long_strike,  2),
+                    "Long Vol":   long_vol,
                     "Width":      round(spread_width, 2),
                     "Net Cr.":    round(net_credit,   2),
                     "Max Risk":   round(max_risk,     2),
@@ -373,15 +374,18 @@ if mode == MODE_CC:
             st.sidebar.error("Cost basis must be a number.")
 
 max_spread_input: float | None = None
-pl_ratio_str = ""
+pl_ratio_n: int | None = None
 if mode in SPREAD_MODES:
     max_spread_input = st.sidebar.number_input(
         "Max spread width ($)", value=10.0, step=1.0, min_value=0.5,
         help="Max distance between the short and long strikes.",
     )
-    pl_ratio_str = st.sidebar.text_input(
-        "Target P/L ratio (e.g. 1:3)", value="1:3",
-        help="Filter spreads with Net Credit / Max Risk ≥ this ratio. Accepts '1:3' or '0.333'.",
+    pl_ratio_n = st.sidebar.slider(
+        "Target P/L ratio", min_value=2, max_value=10, value=3, step=1,
+        format="1:%d",
+        help=("Keep spreads where Net Credit / Max Risk ≥ 1 / N. "
+              "Left (1:2) is stricter — requires ratio ≥ 0.5. "
+              "Right (1:10) is looser — requires ratio ≥ 0.1."),
     )
 
 min_volume_input = st.sidebar.number_input("Min volume", value=0, step=1, min_value=0)
@@ -407,7 +411,7 @@ if run:
     else:
         try:
             if mode in SPREAD_MODES:
-                pl_ratio = _parse_pl_ratio(pl_ratio_str)
+                pl_ratio = 1.0 / pl_ratio_n
                 with st.spinner(f"Fetching option chain for {ticker_input}…"):
                     price, df = fetch_spreads(
                         mode, ticker_input, float(strike_input),
@@ -497,13 +501,15 @@ if active_mode in SPREAD_MODES:
     st.subheader("Top spread pairs by P/L ratio")
     df_top = (df.sort_values(["P/L", "Ann. Ret %"], ascending=False)
                 .head(int(top_n)).reset_index(drop=True))
-    display_cols = ["Expiry", "DTE", "Short K", "Long K", "Width",
-                    "Net Cr.", "Max Risk", "P/L", "Short Δ",
+    display_cols = ["Expiry", "DTE", "Short K", "Short Vol", "Long K", "Long Vol",
+                    "Width", "Net Cr.", "Max Risk", "P/L", "Short Δ",
                     "Ret %", "Ann. Ret %"]
     fmt = {
-        "Short K": "{:.2f}", "Long K": "{:.2f}", "Width": "{:.2f}",
-        "Net Cr.": "{:.2f}", "Max Risk": "{:.2f}", "P/L": "{:.3f}",
-        "Short Δ": "{:+.3f}", "Ret %": "{:.3f}", "Ann. Ret %": "{:.2f}",
+        "Short K": "{:.2f}", "Long K": "{:.2f}",
+        "Short Vol": "{:,}", "Long Vol": "{:,}",
+        "Width": "{:.2f}", "Net Cr.": "{:.2f}", "Max Risk": "{:.2f}",
+        "P/L": "{:.3f}", "Short Δ": "{:+.3f}",
+        "Ret %": "{:.3f}", "Ann. Ret %": "{:.2f}",
     }
 else:
     st.subheader("Top contracts by annualized return")
